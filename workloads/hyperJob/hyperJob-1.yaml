@@ -1,0 +1,47 @@
+apiVersion: training.volcano.sh/v1alpha1
+kind: HyperJob
+metadata:
+  name: example-hyperjob
+  namespace: default
+spec:
+  replicatedJobs:
+  - name: taska
+    clusterNames:
+    - member1
+    replicas: 1
+    templateSpec:
+      maxRetry: 3
+      tasks:
+      - name: worker
+        replicas: 1
+        template:
+          spec:
+            containers:
+            - image: nginx:latest
+              imagePullPolicy: IfNotPresent
+              name: worker
+              resources:
+                limits:
+                  cpu: "0.25"
+                requests:
+                  cpu: "0.25"
+  - name: taskb
+    clusterNames:
+    - member2
+    replicas: 1
+    templateSpec:
+      maxRetry: 3
+      tasks:
+        - name: worker
+          replicas: 1
+          template:
+            spec:
+              containers:
+                - image: nginx:latest
+                  imagePullPolicy: IfNotPresent
+                  name: worker
+                  resources:
+                    limits:
+                      cpu: "0.25"
+                    requests:
+                      cpu: "0.25"

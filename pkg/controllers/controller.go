@@ -19,6 +19,7 @@ package controllers
 import (
 	"fmt"
 
+	clusterv1alpha1 "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
 	policyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,6 +35,7 @@ import (
 	initializescheme "volcano.sh/volcano-global/pkg/controllers/scheme"
 	// Import all controllers to register them.
 	_ "volcano.sh/volcano-global/pkg/controllers/hyperjob"
+	_ "volcano.sh/volcano-global/pkg/controllers/ranktable"
 )
 
 var (
@@ -47,6 +49,7 @@ func init() {
 	utilruntime.Must(trainingv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(policyv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(clusterv1alpha1.AddToScheme(scheme))
 
 	utilruntime.Must(framework.RegisterController(&Controller{}))
 }
