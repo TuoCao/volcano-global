@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package ranktable
 
 import (
@@ -12,21 +28,25 @@ import (
 	karmadautil "github.com/karmada-io/karmada/pkg/util"
 	"github.com/karmada-io/karmada/pkg/util/fedinformer"
 	"github.com/karmada-io/karmada/pkg/util/fedinformer/genericmanager"
+	"golang.org/x/time/rate"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+
 	trainingv1alpha1 "volcano.sh/apis/pkg/apis/training/v1alpha1"
 	volcanoclientset "volcano.sh/apis/pkg/client/clientset/versioned"
 	trainingclientset "volcano.sh/apis/pkg/client/clientset/versioned/typed/training/v1alpha1"
-
 	"volcano.sh/volcano-global/pkg/controllers/scheme"
 )
 
@@ -46,6 +66,14 @@ const (
 	GlobalNetworkLinksSuffix       = "global-network-links"
 )
 
+const (
+	workQueueBaseDelay = 10 * time.Millisecond
+	workQueueMaxDelay  = 10 * time.Second
+	workQueueRateLimit = 50
+	workQueueBurst     = 500
+	workQueueAddDelay  = 10 * time.Millisecond
+)
+
 func init() {
 	scheme.ReconcilerInitializers[ReconcilerName] = InitGlobalRanktableReconciler
 }
@@ -63,31 +91,26 @@ type GlobalAggregationController struct {
 	ClusterStatusUpdateFrequency metav1.Duration
 	ClusterCacheSyncTimeout      metav1.Duration
 	ClusterEventHandlerStore     cache.ThreadSafeStore
-	GlobalEventChan              chan EventKeyInfo
+	Queue                        workqueue.TypedRateLimitingInterface[SyncEvent]
 }
 
 func InitGlobalRanktableReconciler(mgr controllerruntime.Manager) error {
+	predicateFunc := func(obj client.Object) bool {
+		cluster, ok := obj.(*clusterv1alpha1.Cluster)
+		if !ok || cluster.Spec.SecretRef == nil {
+			return false
+		}
+		return cluster.Spec.SyncMode == clusterv1alpha1.Push
+	}
 	clusterPredicateFunc := predicate.Funcs{
 		CreateFunc: func(createEvent event.CreateEvent) bool {
-			obj := createEvent.Object.(*clusterv1alpha1.Cluster)
-			if obj.Spec.SecretRef == nil {
-				return false
-			}
-			return obj.Spec.SyncMode == clusterv1alpha1.Push
+			return predicateFunc(createEvent.Object)
 		},
 		UpdateFunc: func(updateEvent event.UpdateEvent) bool {
-			obj := updateEvent.ObjectNew.(*clusterv1alpha1.Cluster)
-			if obj.Spec.SecretRef == nil {
-				return false
-			}
-			return obj.Spec.SyncMode == clusterv1alpha1.Push
+			return predicateFunc(updateEvent.ObjectNew)
 		},
 		DeleteFunc: func(deleteEvent event.DeleteEvent) bool {
-			obj := deleteEvent.Object.(*clusterv1alpha1.Cluster)
-			if obj.Spec.SecretRef == nil {
-				return false
-			}
-			return obj.Spec.SyncMode == clusterv1alpha1.Push
+			return predicateFunc(deleteEvent.Object)
 		},
 		GenericFunc: func(e event.TypedGenericEvent[client.Object]) bool {
 			return false
@@ -107,9 +130,13 @@ func InitGlobalRanktableReconciler(mgr controllerruntime.Manager) error {
 		ClusterStatusUpdateFrequency: metav1.Duration{Duration: 10 * time.Second},
 		ClusterCacheSyncTimeout:      metav1.Duration{Duration: 10 * time.Second},
 		ClusterEventHandlerStore:     cache.NewThreadSafeStore(cache.Indexers{}, cache.Indices{}),
-		GlobalEventChan:              make(chan EventKeyInfo, 100),
+		Queue: workqueue.NewTypedRateLimitingQueue[SyncEvent](workqueue.NewTypedMaxOfRateLimiter(
+			workqueue.NewTypedItemExponentialFailureRateLimiter[SyncEvent](workQueueBaseDelay, workQueueMaxDelay),
+			&workqueue.TypedBucketRateLimiter[SyncEvent]{Limiter: rate.NewLimiter(rate.Limit(workQueueRateLimit), workQueueBurst)})),
 	}
-	go reconciler.processGlobalEvents(context.TODO())
+
+	ctx := context.TODO()
+	go wait.Until(reconciler.RunWorker, 0, ctx.Done())
 	return reconciler.SetupWithManager(mgr)
 }
 
@@ -124,15 +151,14 @@ func (g *GlobalAggregationController) Reconcile(ctx context.Context, request con
 	cluster := &clusterv1alpha1.Cluster{}
 	if err := g.Client.Get(ctx, request.NamespacedName, cluster); err != nil {
 		// The cluster may no longer exist, in which case we stop its informer and delete its handler.
-		// todo:
 		if apierrors.IsNotFound(err) {
 			log.V(4).Info("Failed to find the cluster, stop tracking it", "cluster", request.Name)
 			g.ClusterEventHandlerStore.Delete(request.Name)
 			g.ClusterInformerManager.Stop(request.Name)
 			return controllerruntime.Result{}, nil
 		}
-		log.Error(err, "Failed to get the cluster, stop tracking it", "cluster", request.Name)
-		return controllerruntime.Result{}, err
+		log.Error(err, "Failed to get the cluster", "cluster", request.Name)
+		return controllerruntime.Result{RequeueAfter: g.ClusterStatusUpdateFrequency.Duration}, err
 	}
 	err := g.syncClusterInformer(ctx, cluster)
 	if err != nil {
@@ -162,14 +188,13 @@ func (g *GlobalAggregationController) syncClusterInformer(ctx context.Context, c
 			ranktableStore:         cache.NewThreadSafeStore(cache.Indexers{}, cache.Indices{}),
 		}
 		singleClusterInformerManager.ForResource(ConfigMapGroupVersionResource,
-			fedinformer.NewFilteringHandlerOnAllEvents(clusterEventHandler.EventFilter, clusterEventHandler.OnAdd, clusterEventHandler.OnUpdate, clusterEventHandler.OnDelete))
-		singleClusterInformerManager.ForResource(PodGroupVersionResource, cache.ResourceEventHandlerFuncs{})
+			fedinformer.NewHandlerOnEvents(clusterEventHandler.OnAdd, clusterEventHandler.OnUpdate, clusterEventHandler.OnDelete))
 		g.ClusterEventHandlerStore.Add(cluster.Name, clusterEventHandler)
 		singleClusterInformerManager.Start()
 	}
 
 	// Sync the configmap resource for the given cluster
-	if singleClusterInformerManager.IsInformerSynced(ConfigMapGroupVersionResource) && singleClusterInformerManager.IsInformerSynced(PodGroupVersionResource) {
+	if singleClusterInformerManager.IsInformerSynced(ConfigMapGroupVersionResource) {
 		return nil
 	}
 	if err := func() error {
@@ -177,8 +202,8 @@ func (g *GlobalAggregationController) syncClusterInformer(ctx context.Context, c
 		if synced == nil {
 			return fmt.Errorf("no informer factory exists for the cluster")
 		}
-		if !synced[ConfigMapGroupVersionResource] || !synced[PodGroupVersionResource] {
-			return fmt.Errorf("syncing configmap and pod informer timed out")
+		if !synced[ConfigMapGroupVersionResource] {
+			return fmt.Errorf("syncing configmap informer timed out")
 		}
 		return nil
 	}(); err != nil {
@@ -191,69 +216,115 @@ func (g *GlobalAggregationController) syncClusterInformer(ctx context.Context, c
 	return nil
 }
 
-func (g *GlobalAggregationController) processGlobalEvents(ctx context.Context) {
-	for {
-		eventKeyInfo := <-g.GlobalEventChan
-		g.syncGlobalRanktableAndNetworkLinks(ctx, eventKeyInfo)
+func (g *GlobalAggregationController) RunWorker() {
+	for g.processNextItem() {
 	}
 }
 
-func (g *GlobalAggregationController) syncGlobalRanktableAndNetworkLinks(ctx context.Context, event EventKeyInfo) {
-	log := controllerruntime.LoggerFrom(ctx)
-	log.V(4).Info("Begin to sync the global ranktable and network links", "jobName", event.Name)
-	defer log.V(4).Info("Finish syncing the global ranktable and network links", "jobName", event.Name)
-
-	// obtain the corresponding hyperJob
-	job, err := g.JobClient.BatchV1alpha1().Jobs(event.Namespace).Get(ctx, event.Name, metav1.GetOptions{})
-	if err != nil {
-		log.Error(err, "Failed to get the job", "job", event.Name)
-		return
+func (g *GlobalAggregationController) processNextItem() bool {
+	syncEvent, quit := g.Queue.Get()
+	if quit {
+		return false
 	}
-	jobOwner, err := g.getJobOwner(job)
+	defer g.Queue.Done(syncEvent)
+
+	klog.V(4).Infof("Begin to handle sync event %s", syncEvent.getKey())
+	defer klog.V(4).Infof("Finishing handling sync event %s", syncEvent.getKey())
+
+	if err := g.handleEvent(syncEvent); err != nil {
+		g.Queue.AddRateLimited(syncEvent)
+		klog.V(4).Infof("Failed to handle sync event %s, err: %v", syncEvent.getKey(), err)
+	} else {
+		g.Queue.Forget(syncEvent)
+	}
+	return true
+}
+
+func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
+	// obtain the corresponding hyperJob
+	ctx := context.TODO()
+	job, err := g.JobClient.BatchV1alpha1().Jobs(syncEvent.Namespace).Get(ctx, syncEvent.Name, metav1.GetOptions{})
 	if err != nil {
-		log.Error(err, "Failed to get the owner reference of the job", "job", event.Name)
-		return
+		return err
+	}
+	jobOwner, err := getJobOwner(job)
+	if err != nil {
+		return err
 	}
 	hyperJob, err := g.HyperJobClient.HyperJobs(job.Namespace).Get(ctx, jobOwner.Name, metav1.GetOptions{})
 	if err != nil {
-		log.Error(err, "Failed to get the hyperJob", "hyperJob", jobOwner.Name)
-		return
+		return err
 	}
 	if hyperJob.DeletionTimestamp != nil {
-		log.V(4).Info("The corresponding hyperJob has been deleted, no need to sync", "hyperJob", hyperJob.Name)
-		return
+		klog.V(4).Infof("hyperJob %s has been deleted, no need to sync", hyperJob.Name)
+		return nil
 	}
 
 	// update the global ranktable for the hyperJob
+	globalRanktable := g.generateHyperJobGlobalRanktable(hyperJob)
+	if globalRanktable.Status != RanktableStatusCompleted {
+		klog.V(4).Infof("The global ranktable of hyperJob %s is not completed, no need to update its configMap", hyperJob.Name)
+		return nil
+	}
 	configMapName := fmt.Sprintf("%s-%s", hyperJob.Name, GlobalRanktableSuffix)
 	currentConfigMap, err := g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Get(ctx, configMapName, metav1.GetOptions{})
 	if err != nil {
-		log.Error(err, "Failed to get the configMap of the global ranktable", "configmap", configMapName)
-		return
+		return err
 	}
 	configMap := currentConfigMap.DeepCopy()
-	globalRanktable := g.generateGlobalRanktableForHyperJob(hyperJob)
-	currentGlobalRanktable := getGlobalRanktableFromConfigMap(currentConfigMap)
-	if currentGlobalRanktable != nil {
+	currentGlobalRanktable, err := getGlobalRanktableFromConfigMap(currentConfigMap)
+	if err != nil {
+		globalRanktable.DataVersion = 1
+	} else {
 		globalRanktable.DataVersion = currentGlobalRanktable.DataVersion + 1
 	}
-	globalRanktableBytes, _ := json.Marshal(globalRanktable)
+	globalRanktableBytes, err := json.Marshal(globalRanktable)
+	if err != nil {
+		return err
+	}
 	if len(configMap.Data) == 0 {
 		configMap.Data = make(map[string]string)
 	}
 	configMap.Data[MountJobStartHcclName] = string(globalRanktableBytes)
+	_, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Update(ctx, configMap, metav1.UpdateOptions{})
+	if err != nil {
+		klog.V(4).Infof("Failed to update configMap %s, err: %v", configMapName, err)
+		return err
+	} else {
+		klog.V(4).Infof("Successful to update configMap %s", configMapName)
+	}
+
+	// update the global network links for the hyperJob
+	configMapName = fmt.Sprintf("%s-%s", hyperJob.Name, GlobalNetworkLinksSuffix)
+	currentConfigMap, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Get(ctx, configMapName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	configMap = currentConfigMap.DeepCopy()
+	globalNetworkLinks := g.generateHyperJobGlobalNetworkLinks(ctx, hyperJob)
+	currentGlobalNetworkLinks, err := getGlobalNetworkLinksFromConfigMap(currentConfigMap)
+	if err != nil {
+		globalNetworkLinks.DataVersion = 1
+	} else {
+		globalNetworkLinks.DataVersion = currentGlobalNetworkLinks.DataVersion + 1
+	}
+	globalNetworkLinksBytes, err := json.Marshal(globalNetworkLinks)
+	if err != nil {
+		return err
+	}
+	if len(configMap.Data) == 0 {
+		configMap.Data = make(map[string]string)
+	}
+	configMap.Data[MountNetworkLinksName] = string(globalNetworkLinksBytes)
 
 	_, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Update(ctx, configMap, metav1.UpdateOptions{})
 	if err != nil {
-		log.Error(err, "Failed to update the configMap of the global ranktable", "configMap", configMapName)
+		klog.V(4).Infof("Failed to update configMap %s, err: %v", configMapName, err)
+		return err
 	} else {
-		log.V(4).Info("Successful to update the configMap of the global ranktable", "configMap", configMapName)
+		klog.V(4).Infof("Successful to update configMap %s", configMapName)
 	}
-	if globalRanktable.Status == RanktableStatusCompleted {
-		g.syncGlobalNetworkLinks(ctx, hyperJob)
-	} else {
-		log.V(4).Info("The global ranktable is not completed, no need to sync the global network links", "configMap", configMapName)
-	}
+	return nil
 }
 
 func (g *GlobalAggregationController) getJobRanktableInfo(namespace string, name string, clusterNames []string) *SingleRanktableInfo {
@@ -262,9 +333,15 @@ func (g *GlobalAggregationController) getJobRanktableInfo(namespace string, name
 	}
 	for _, clusterName := range clusterNames {
 		if clusterEventHandlerObj, exists := g.ClusterEventHandlerStore.Get(clusterName); exists {
-			clusterEventHandler, _ := clusterEventHandlerObj.(*ClusterEventHandler)
-			if ranktableObj, exists := clusterEventHandler.ranktableStore.Get(getSingleRanktableKeyByNamespaceAndName(namespace, name)); exists {
-				ranktable, _ := ranktableObj.(*SingleRanktable)
+			clusterEventHandler, ok := clusterEventHandlerObj.(*ClusterEventHandler)
+			if !ok {
+				continue
+			}
+			if ranktableObj, exists := clusterEventHandler.ranktableStore.Get(getSingleRanktableKeyByJobNamespaceAndName(namespace, name)); exists {
+				ranktable, ok := ranktableObj.(*SingleRanktable)
+				if !ok {
+					continue
+				}
 				return &SingleRanktableInfo{clusterId: clusterName, jobName: name, ranktable: ranktable}
 			}
 		}
@@ -272,8 +349,7 @@ func (g *GlobalAggregationController) getJobRanktableInfo(namespace string, name
 	return nil
 }
 
-// todo: implement the workflow of consulting PSM
-func (g *GlobalAggregationController) generateGlobalRanktableForHyperJob(hyperJob *trainingv1alpha1.HyperJob) *GlobalRanktable {
+func (g *GlobalAggregationController) generateHyperJobGlobalRanktable(hyperJob *trainingv1alpha1.HyperJob) *GlobalRanktable {
 	ranktableInfoSlice := make([]*SingleRanktableInfo, 0)
 	allCompleted := true
 	// get all the existing ranktables belonging to this hyperJob
@@ -295,11 +371,11 @@ func (g *GlobalAggregationController) generateGlobalRanktableForHyperJob(hyperJo
 	sort.Slice(ranktableInfoSlice, func(i, j int) bool {
 		if ranktableInfoSlice[i].clusterId < ranktableInfoSlice[j].clusterId {
 			return true
-		} else if ranktableInfoSlice[i].clusterId == ranktableInfoSlice[j].clusterId && ranktableInfoSlice[i].jobName <= ranktableInfoSlice[j].jobName {
-			return true
-		} else {
-			return false
 		}
+		if ranktableInfoSlice[i].clusterId == ranktableInfoSlice[j].clusterId && ranktableInfoSlice[i].jobName <= ranktableInfoSlice[j].jobName {
+			return true
+		}
+		return false
 	})
 	// aggregate the ranktables into one global ranktable, arrange the rankIds and the clusterList
 	globalRanktable := NewGlobalRanktable()
@@ -342,91 +418,60 @@ func (g *GlobalAggregationController) generateGlobalRanktableForHyperJob(hyperJo
 	return globalRanktable
 }
 
-func (g *GlobalAggregationController) getJobOwner(job *batchv1alpha1.Job) (*metav1.OwnerReference, error) {
-	for _, owner := range job.OwnerReferences {
-		ownerGV, _ := schema.ParseGroupVersion(owner.APIVersion)
-		ownerGVK := schema.GroupVersionKind{
-			Group:   ownerGV.Group,
-			Version: ownerGV.Version,
-			Kind:    owner.Kind,
-		}
-		if ownerGVK == HyperJobGroupVersionKind {
-			return &owner, nil
-		}
-	}
-	return nil, fmt.Errorf("job %s/%s does not have a wanted owner reference", job.Namespace, job.Name)
-}
-
-func (g *GlobalAggregationController) syncGlobalNetworkLinks(ctx context.Context, hyperJob *trainingv1alpha1.HyperJob) {
-	log := controllerruntime.LoggerFrom(ctx)
-	log.V(4).Info("Begin to sync the global network links", "hyperJobName", hyperJob.Name)
-	defer log.V(4).Info("Finish syncing the global network links", "hyperJobName", hyperJob.Name)
-
-	// update the global network links for the hyperJob
-	configMapName := fmt.Sprintf("%s-%s", hyperJob.Name, GlobalNetworkLinksSuffix)
-	currentConfigMap, err := g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Get(ctx, configMapName, metav1.GetOptions{})
-	if err != nil {
-		log.Error(err, "Failed to get the configMap of the global network links", "configmap", configMapName)
-		return
-	}
-	configMap := currentConfigMap.DeepCopy()
-	globalNetworkLinks := g.generateGlobalNetworkLinksForHyperJob(ctx, hyperJob)
-	currentGlobalNetworkLinks := getGlobalNetworkLinksFromConfigMap(currentConfigMap)
-	if currentGlobalNetworkLinks != nil {
-		globalNetworkLinks.DataVersion = currentGlobalNetworkLinks.DataVersion + 1
-	}
-	globalNetworkLinksBytes, _ := json.Marshal(globalNetworkLinks)
-	if len(configMap.Data) == 0 {
-		configMap.Data = make(map[string]string)
-	}
-	configMap.Data[MountNetworkLinksName] = string(globalNetworkLinksBytes)
-
-	_, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Update(ctx, configMap, metav1.UpdateOptions{})
-	if err != nil {
-		log.Error(err, "Failed to update the configMap of the global network links", "configMap", configMapName)
-	} else {
-		log.V(4).Info("Successful to update the configMap of the network links", "configMap", configMapName)
-	}
-}
-
-func (g *GlobalAggregationController) getJobClusterName(namespace string, name string, clusterNames []string) string {
+func (g *GlobalAggregationController) getJobNetworkLinksInfo(ctx context.Context, namespace string, name string, clusterNames []string) map[string]string {
 	if len(clusterNames) == 0 {
 		clusterNames = g.ClusterEventHandlerStore.ListKeys()
 	}
+	selector := fmt.Sprintf("%s=%s, %s=%s", JobNamespaceLableKey, namespace, JobNameLabelKey, name)
 	for _, clusterName := range clusterNames {
 		if clusterEventHandlerObj, exists := g.ClusterEventHandlerStore.Get(clusterName); exists {
-			clusterEventHandler, _ := clusterEventHandlerObj.(*ClusterEventHandler)
-			if _, exists = clusterEventHandler.ranktableStore.Get(getSingleRanktableKeyByNamespaceAndName(namespace, name)); exists {
-				return clusterName
+			clusterEventHandler, ok := clusterEventHandlerObj.(*ClusterEventHandler)
+			if !ok {
+				continue
+			}
+			if _, exists = clusterEventHandler.ranktableStore.Get(getSingleRanktableKeyByJobNamespaceAndName(namespace, name)); exists {
+				dynamicClient, err := g.ClusterDynamicClientSetFunc(clusterName, g.Client, &g.ClusterClientOption)
+				if err != nil {
+					klog.V(4).Infof("Failed to get the dynamic client of cluster %s for job %s, err: %v", clusterName, name, err)
+					continue
+				}
+				unstructuredList, err := dynamicClient.DynamicClientSet.Resource(PodGroupVersionResource).List(ctx, metav1.ListOptions{LabelSelector: selector})
+				if err != nil {
+					klog.V(4).Infof("Failed to get the selected pod list of cluster %s for job %s, err: %v", clusterName, name, err)
+					continue
+				}
+				networkLinkMap := make(map[string]string)
+				for _, item := range unstructuredList.Items {
+					pod := &corev1.Pod{}
+					if err = runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, pod); err != nil {
+						klog.V(4).Infof("Failed to convert the unstructured item of cluster %s for job %s to a pod, err: %v", clusterName, name, err)
+					} else {
+						networkLinkMap[fmt.Sprintf("%s.%s", pod.Name, clusterName)] = pod.Status.PodIP
+					}
+				}
+				return networkLinkMap
 			}
 		}
 	}
-	return ""
+	return nil
 }
-
-func (g *GlobalAggregationController) generateGlobalNetworkLinksForHyperJob(ctx context.Context, hyperJob *trainingv1alpha1.HyperJob) *GlobalNetworkLinks {
-	log := controllerruntime.LoggerFrom(ctx)
+func (g *GlobalAggregationController) generateHyperJobGlobalNetworkLinks(ctx context.Context, hyperJob *trainingv1alpha1.HyperJob) *GlobalNetworkLinks {
 	globalNetworkLinks := NewGlobalNetworkLinks()
 	allCompleted := true
 	for _, replicatedJob := range hyperJob.Spec.ReplicatedJobs {
 		for i := 0; i < int(replicatedJob.Replicas); i++ {
 			jobName := fmt.Sprintf("%s-%s-%d", hyperJob.Name, replicatedJob.Name, i)
-			clusterName := g.getJobClusterName(hyperJob.Namespace, jobName, replicatedJob.ClusterNames)
+			networkLinksMap := g.getJobNetworkLinksInfo(ctx, hyperJob.Namespace, jobName, replicatedJob.ClusterNames)
+			totalPodNumber := 0
 			for _, task := range replicatedJob.TemplateSpec.Tasks {
-				for j := 0; j < int(task.Replicas); j++ {
-					podName := fmt.Sprintf("%s-%s-%d-%s-%d", hyperJob.Name, replicatedJob.Name, i, task.Name, j)
-					obj, err := g.ClusterInformerManager.GetSingleClusterManager(clusterName).Lister(PodGroupVersionResource).ByNamespace(hyperJob.Namespace).Get(podName)
-					if err != nil {
-						allCompleted = false
-						continue
-					}
-					pod := convertObjToPod(obj)
-					if pod == nil {
-						log.V(4).Info("Failed to convert the obj to the pod", "pod", podName)
-						continue
-					}
-					globalNetworkLinks.NetworkLinks[fmt.Sprintf("%s.%s", podName, clusterName)] = pod.Status.PodIP
-				}
+				totalPodNumber += int(task.Replicas)
+			}
+			if len(networkLinksMap) != totalPodNumber {
+				klog.V(4).Infof("Failed to get all the network links of job %s", jobName)
+				allCompleted = false
+			}
+			for key, value := range networkLinksMap {
+				globalNetworkLinks.NetworkLinks[key] = value
 			}
 		}
 	}
@@ -438,41 +483,3 @@ func (g *GlobalAggregationController) generateGlobalNetworkLinksForHyperJob(ctx 
 	globalNetworkLinks.PodCount = strconv.Itoa(len(globalNetworkLinks.NetworkLinks))
 	return globalNetworkLinks
 }
-
-//func (g *GlobalAggregationController) getClusterNamesOfHyperJob(hyperJob *trainingv1alpha1.HyperJob) []string {
-//	clusterNameMap := make(map[string]struct{})
-//	clusterNames := make([]string, 0)
-//	for _, replicatedJob := range hyperJob.Spec.ReplicatedJobs {
-//		if len(replicatedJob.ClusterNames) == 0 {
-//			return g.ClusterEventHandlerStore.ListKeys()
-//		} else {
-//			for _, clusterName := range replicatedJob.ClusterNames {
-//				if _, ok := clusterNameMap[clusterName]; !ok {
-//					clusterNameMap[clusterName] = struct{}{}
-//					clusterNames = append(clusterNames, clusterName)
-//				}
-//			}
-//		}
-//	}
-//	return clusterNames
-//}
-
-//func (g *GlobalAggregationController) getJobPodIpInfo(namespace string, name string, clusterNames []string) []SingleNetworkLinkInfo {
-//	if len(clusterNames) == 0 {
-//		clusterNames = g.ClusterEventHandlerStore.ListKeys()
-//	}
-//	selector, _ := labels.Parse(fmt.Sprintf("%s=%s, %s=%s", JobNamespaceLableKey, namespace, JobNameLabelKey, name))
-//	for _, clusterName := range clusterNames {
-//		objs, _ := g.ClusterInformerManager.GetSingleClusterManager(clusterName).Lister(PodGroupVersionResource).List(selector)
-//		if len(objs) > 0 {
-//			networkLinkMap := make(map[string]string)
-//			for _, obj := range objs {
-//				pod, _ := obj.(*corev1.Pod)
-//				networkLinkMap[fmt.Sprintf("%s.%s", pod.Name, clusterName)] = pod.Status.PodIP
-//
-//			}
-//			return singlePodIpInfoSlince
-//		}
-//	}
-//	return nil
-//}

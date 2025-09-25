@@ -1,14 +1,25 @@
+/*
+Copyright 2025 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package ranktable
 
 import (
-	"context"
-
 	"github.com/karmada-io/karmada/pkg/util/fedinformer/genericmanager"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/cache"
-	controllerruntime "sigs.k8s.io/controller-runtime"
+	"k8s.io/klog/v2"
 )
 
 type ClusterEventHandler struct {
@@ -18,43 +29,42 @@ type ClusterEventHandler struct {
 	ranktableStore         cache.ThreadSafeStore
 }
 
-func (c *ClusterEventHandler) EventFilter(obj interface{}) bool {
-	configMap := convertObjToConfigMap(obj)
-	if configMap == nil {
-		return false
-	}
-	owner := c.getConfigMapOwner(configMap)
-	return owner != nil
-}
-
 func (c *ClusterEventHandler) OnAdd(obj interface{}) {
-	ctx := context.TODO()
-	log := controllerruntime.LoggerFrom(ctx)
-	log.V(4).Info("Start to handle an add/update event")
-	defer log.V(4).Info("Finish handling the add/update event")
-	configMap := convertObjToConfigMap(obj)
-	owner := c.getConfigMapOwner(configMap)
-	ranktable := getSingleRanktableFromConfigmap(configMap)
-	if ranktable == nil {
-		log.V(4).Info("The configMap has no ranktable", "configMap", configMap.Name)
+	klog.V(4).Infof("Begin to handle an add/update event on cluster %s", c.clusterName)
+	defer klog.V(4).Infof("Finish handling the add/update event on cluster %s", c.clusterName)
+	configMap, err := convertObjToConfigMap(obj)
+	if err != nil {
+		klog.V(4).Infof("The obj of this event is not a configMap, err: %v", err)
 		return
 	}
-	ranktableKey := getSingleRanktableKeyByNamespaceAndName(configMap.Namespace, owner.Name)
+	owner, err := getConfigMapOwner(configMap)
+	if err != nil {
+		klog.V(4).Infof("ConfigMap %s dose not have a wanted owner reference, err: %v", configMap.Name, err)
+		return
+	}
+	ranktable, err := getSingleRanktableFromConfigMap(configMap)
+	if err != nil {
+		klog.V(4).Infof("Failed to get the ranktable of configMap %s, err: %v", configMap.Name, err)
+		return
+	}
+	ranktableKey := getSingleRanktableKeyByJobNamespaceAndName(configMap.Namespace, owner.Name)
 	if currentRanktableObj, exists := c.ranktableStore.Get(ranktableKey); exists {
-		currentRanktable, _ := currentRanktableObj.(*SingleRanktable)
-		if ranktable.DataVersion <= currentRanktable.DataVersion {
-			log.V(4).Info("The ranktable is outdated, no need to update",
-				"ranktableDataVersion", ranktable.DataVersion, "currentRanktableDataVersion", currentRanktable.DataVersion)
+		currentRanktable, ok := currentRanktableObj.(*SingleRanktable)
+		if !ok {
+			c.ranktableStore.Update(ranktableKey, ranktable)
+			klog.V(4).Infof("The type of the object (key is %s) in the store is not *ranktable, overwritted it", ranktableKey)
+		} else if ranktable.DataVersion <= currentRanktable.DataVersion {
+			klog.V(4).Infof("The ranktable of comfigMap %s is outdated, no need to update", configMap.Name)
 			return
 		} else {
 			c.ranktableStore.Update(ranktableKey, ranktable)
-			log.V(4).Info("The ranktable has been successfully updated")
+			klog.V(4).Infof("The ranktable of configMap %s has been successfully updated", configMap.Name)
 		}
 	} else {
 		c.ranktableStore.Add(ranktableKey, ranktable)
-		log.V(4).Info("The ranktable has been successfully added")
+		klog.V(4).Infof("The ranktable of configMap %s has been successfully added", configMap.Name)
 	}
-	c.globalController.GlobalEventChan <- EventKeyInfo{Namespace: configMap.Namespace, Name: owner.Name}
+	c.globalController.Queue.AddAfter(SyncEvent{Namespace: configMap.Namespace, Name: owner.Name}, workQueueAddDelay)
 }
 
 func (c *ClusterEventHandler) OnUpdate(_, newObj interface{}) {
@@ -62,44 +72,37 @@ func (c *ClusterEventHandler) OnUpdate(_, newObj interface{}) {
 }
 
 func (c *ClusterEventHandler) OnDelete(obj interface{}) {
-	ctx := context.TODO()
-	log := controllerruntime.LoggerFrom(ctx)
-	log.V(4).Info("Start to handle a delete event")
-	defer log.V(4).Info("Finish handling the delete event")
-	configMap := convertObjToConfigMap(obj)
-	owner := c.getConfigMapOwner(configMap)
-	ranktable := getSingleRanktableFromConfigmap(configMap)
-	if ranktable == nil {
-		log.V(4).Info("The configMap has no ranktable", "configMap", configMap.Name)
+	klog.V(4).Infof("Begin to handle a delete event on cluster %s", c.clusterName)
+	defer klog.V(4).Infof("Finish handling the delete event on cluster %s", c.clusterName)
+	configMap, err := convertObjToConfigMap(obj)
+	if err != nil {
+		klog.V(4).Infof("The obj of this event is not a configMap, err: %v", err)
 		return
 	}
-	ranktableKey := getSingleRanktableKeyByNamespaceAndName(configMap.Namespace, owner.Name)
+	owner, err := getConfigMapOwner(configMap)
+	if err != nil {
+		klog.V(4).Infof("ConfigMap %s dose not have a wanted owner reference, err: %v", configMap.Name, err)
+		return
+	}
+	ranktable, err := getSingleRanktableFromConfigMap(configMap)
+	if err != nil {
+		klog.V(4).Infof("Failed to get the ranktable of configMap %s, err: %v", configMap.Name, err)
+		return
+	}
+	ranktableKey := getSingleRanktableKeyByJobNamespaceAndName(configMap.Namespace, owner.Name)
 	if currentRanktableObj, exists := c.ranktableStore.Get(ranktableKey); exists {
-		currentRanktable, _ := currentRanktableObj.(*SingleRanktable)
+		currentRanktable, ok := currentRanktableObj.(*SingleRanktable)
+		if !ok {
+			c.ranktableStore.Delete(ranktableKey)
+			klog.V(4).Infof("The type of the object (key is %s) in the store is not *ranktable, deleted it", ranktableKey)
+		}
 		if ranktable.DataVersion < currentRanktable.DataVersion {
-			log.V(4).Info("The ranktable is outdated, no need to update",
-				"ranktableDataVersion", ranktable.DataVersion, "currentRanktableDataVersion", currentRanktable.DataVersion)
+			klog.V(4).Infof("The ranktable of comfigMap %s is outdated, no need to delete", configMap.Name)
 		} else {
 			c.ranktableStore.Delete(ranktableKey)
-			log.V(4).Info("The ranktable has been successfully deleted")
-			c.globalController.GlobalEventChan <- EventKeyInfo{Namespace: configMap.Namespace, Name: owner.Name}
+			klog.V(4).Infof("The ranktable of configMap %s has been successfully deleted", configMap.Name)
 		}
 	} else {
-		log.V(4).Info("The ranktable has not been stored before, no need to delete", "configMap", configMap.Name)
+		klog.V(4).Infof("The ranktable of configMap %s has not been stored before, no need to delete", configMap.Name)
 	}
-}
-
-func (c *ClusterEventHandler) getConfigMapOwner(configMap *corev1.ConfigMap) *metav1.OwnerReference {
-	for _, owner := range configMap.OwnerReferences {
-		ownerGV, _ := schema.ParseGroupVersion(owner.APIVersion)
-		ownerGVK := schema.GroupVersionKind{
-			Group:   ownerGV.Group,
-			Version: ownerGV.Version,
-			Kind:    owner.Kind,
-		}
-		if ownerGVK == JobGroupVersionKind {
-			return &owner
-		}
-	}
-	return nil
 }
