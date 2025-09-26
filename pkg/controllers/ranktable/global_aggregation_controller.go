@@ -310,7 +310,10 @@ func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
 		return err
 	}
 	configMap = currentConfigMap.DeepCopy()
-	globalNetworkLinks := g.generateHyperJobGlobalNetworkLinks(ctx, hyperJob)
+	globalNetworkLinks, err := g.generateHyperJobGlobalNetworkLinks(ctx, hyperJob)
+	if err != nil {
+		return err
+	}
 	currentGlobalNetworkLinks, err := getGlobalNetworkLinksFromConfigMap(currentConfigMap)
 	if err != nil {
 		// in this case, the configMap's current version has no network links, or its network links are invalid, and we set the DataVersion of the new global network links to 1
@@ -429,7 +432,7 @@ func (g *GlobalAggregationController) generateHyperJobGlobalRanktable(hyperJob *
 	return globalRanktable
 }
 
-func (g *GlobalAggregationController) getJobNetworkLinksInfo(ctx context.Context, namespace string, name string, clusterNames []string) map[string]string {
+func (g *GlobalAggregationController) getJobNetworkLinksInfo(ctx context.Context, namespace string, name string, clusterNames []string) (map[string]string, error) {
 	if len(clusterNames) == 0 {
 		clusterNames = g.ClusterEventHandlerStore.ListKeys()
 	}
@@ -445,35 +448,39 @@ func (g *GlobalAggregationController) getJobNetworkLinksInfo(ctx context.Context
 				dynamicClient, err := g.ClusterDynamicClientSetFunc(clusterName, g.Client, &g.ClusterClientOption)
 				if err != nil {
 					klog.V(4).Infof("Failed to get the dynamic client of cluster %s for job %s, err: %v", clusterName, name, err)
-					continue
+					return nil, err
 				}
 				unstructuredList, err := dynamicClient.DynamicClientSet.Resource(PodGroupVersionResource).List(ctx, metav1.ListOptions{LabelSelector: labelSelector.String()})
 				if err != nil {
 					klog.V(4).Infof("Failed to get the selected pod list of cluster %s for job %s, err: %v", clusterName, name, err)
-					continue
+					return nil, err
 				}
 				networkLinkMap := make(map[string]string)
 				for _, item := range unstructuredList.Items {
 					pod := &corev1.Pod{}
 					if err = runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, pod); err != nil {
 						klog.V(4).Infof("Failed to convert the unstructured item of cluster %s for job %s to a pod, err: %v", clusterName, name, err)
+						return nil, err
 					} else {
 						networkLinkMap[fmt.Sprintf("%s.%s", pod.Name, clusterName)] = pod.Status.PodIP
 					}
 				}
-				return networkLinkMap
+				return networkLinkMap, nil
 			}
 		}
 	}
-	return nil
+	return nil, fmt.Errorf("no network links are found for job %s", name)
 }
-func (g *GlobalAggregationController) generateHyperJobGlobalNetworkLinks(ctx context.Context, hyperJob *trainingv1alpha1.HyperJob) *GlobalNetworkLinks {
+func (g *GlobalAggregationController) generateHyperJobGlobalNetworkLinks(ctx context.Context, hyperJob *trainingv1alpha1.HyperJob) (*GlobalNetworkLinks, error) {
 	globalNetworkLinks := NewGlobalNetworkLinks()
 	allCompleted := true
 	for _, replicatedJob := range hyperJob.Spec.ReplicatedJobs {
 		for i := 0; i < int(replicatedJob.Replicas); i++ {
 			jobName := fmt.Sprintf("%s-%s-%d", hyperJob.Name, replicatedJob.Name, i)
-			networkLinksMap := g.getJobNetworkLinksInfo(ctx, hyperJob.Namespace, jobName, replicatedJob.ClusterNames)
+			networkLinksMap, err := g.getJobNetworkLinksInfo(ctx, hyperJob.Namespace, jobName, replicatedJob.ClusterNames)
+			if err != nil {
+				return nil, err
+			}
 			totalPodNumber := 0
 			for _, task := range replicatedJob.TemplateSpec.Tasks {
 				totalPodNumber += int(task.Replicas)
@@ -493,5 +500,5 @@ func (g *GlobalAggregationController) generateHyperJobGlobalNetworkLinks(ctx con
 		globalNetworkLinks.Status = NetworkLinksStatusInitializing
 	}
 	globalNetworkLinks.PodCount = strconv.Itoa(len(globalNetworkLinks.NetworkLinks))
-	return globalNetworkLinks
+	return globalNetworkLinks, nil
 }

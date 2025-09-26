@@ -54,7 +54,7 @@ func (c *ClusterEventHandler) OnAdd(obj interface{}) {
 			c.ranktableStore.Update(ranktableKey, ranktable)
 			klog.V(4).Infof("The type of the object (key is %s) in the store is not *ranktable, overwritted it", ranktableKey)
 		} else if ranktable.DataVersion <= currentRanktable.DataVersion {
-			klog.V(4).Infof("The ranktable of comfigMap %s is outdated, no need to update", configMap.Name)
+			klog.V(4).Infof("The ranktable of configMap %s is outdated, no need to update", configMap.Name)
 			return
 		} else {
 			c.ranktableStore.Update(ranktableKey, ranktable)
@@ -97,7 +97,7 @@ func (c *ClusterEventHandler) OnDelete(obj interface{}) {
 			klog.V(4).Infof("The type of the object (key is %s) in the store is not *ranktable, deleted it", ranktableKey)
 		}
 		if ranktable.DataVersion < currentRanktable.DataVersion {
-			klog.V(4).Infof("The ranktable of comfigMap %s is outdated, no need to delete", configMap.Name)
+			klog.V(4).Infof("The ranktable of configMap %s is outdated, no need to delete", configMap.Name)
 		} else {
 			c.ranktableStore.Delete(ranktableKey)
 			klog.V(4).Infof("The ranktable of configMap %s has been successfully deleted", configMap.Name)

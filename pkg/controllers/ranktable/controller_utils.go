@@ -27,17 +27,18 @@ import (
 	"k8s.io/klog/v2"
 
 	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	trainingv1alpha1 "volcano.sh/apis/pkg/apis/training/v1alpha1"
 )
 
 var (
 	JobGroupVersionKind = schema.GroupVersionKind{
-		Group:   "batch.volcano.sh",
-		Version: "v1alpha1",
+		Group:   batchv1alpha1.SchemeGroupVersion.Group,
+		Version: batchv1alpha1.SchemeGroupVersion.Version,
 		Kind:    "Job",
 	}
 	HyperJobGroupVersionKind = schema.GroupVersionKind{
-		Group:   "training.volcano.sh",
-		Version: "v1alpha1",
+		Group:   trainingv1alpha1.SchemeGroupVersion.Group,
+		Version: trainingv1alpha1.SchemeGroupVersion.Version,
 		Kind:    "HyperJob",
 	}
 	ConfigMapGroupVersionResource = corev1.SchemeGroupVersion.WithResource("configmaps")
