@@ -18,12 +18,12 @@ package ranktable
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
 	"time"
 
+	"encoding/json"
 	clusterv1alpha1 "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
 	karmadautil "github.com/karmada-io/karmada/pkg/util"
 	"github.com/karmada-io/karmada/pkg/util/fedinformer"
@@ -32,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -53,9 +54,8 @@ import (
 const (
 	ReconcilerName                 = "ranktable-reconciler"
 	JobNameLabelKey                = "volcano.sh/job-name"
-	JobNamespaceLableKey           = "volcano.sh/job-namespace"
+	JobNamespaceLabelKey           = "volcano.sh/job-namespace"
 	MountJobStartHcclName          = "jobstart_hccl.json"
-	MountRanktableTorName          = "ranktable_tor.json"
 	MountNetworkLinksName          = "network_links.json"
 	RanktableStatusInitializing    = "initializing"
 	RanktableStatusCompleted       = "completed"
@@ -71,7 +71,6 @@ const (
 	workQueueMaxDelay  = 10 * time.Second
 	workQueueRateLimit = 50
 	workQueueBurst     = 500
-	workQueueAddDelay  = 10 * time.Millisecond
 )
 
 func init() {
@@ -134,16 +133,23 @@ func InitGlobalRanktableReconciler(mgr controllerruntime.Manager) error {
 			workqueue.NewTypedItemExponentialFailureRateLimiter[SyncEvent](workQueueBaseDelay, workQueueMaxDelay),
 			&workqueue.TypedBucketRateLimiter[SyncEvent]{Limiter: rate.NewLimiter(rate.Limit(workQueueRateLimit), workQueueBurst)})),
 	}
-
-	ctx := context.TODO()
-	go wait.Until(reconciler.RunWorker, 0, ctx.Done())
 	return reconciler.SetupWithManager(mgr)
 }
 
 func (g *GlobalAggregationController) SetupWithManager(mgr controllerruntime.Manager) error {
+	if err := mgr.Add(g); err != nil {
+		return fmt.Errorf("failed to add GlobalAggregationController as a runnable to the manager: %w", err)
+	}
 	return controllerruntime.NewControllerManagedBy(mgr).
 		For(&clusterv1alpha1.Cluster{}, builder.WithPredicates(g.ClusterPredicateFunc)).
 		Complete(g)
+}
+
+func (g *GlobalAggregationController) Start(ctx context.Context) error {
+	klog.V(4).Infof("Starting global event processor")
+	wait.Until(g.RunProcessor, 0, ctx.Done())
+	klog.V(4).Infof("Shutting down global event processor")
+	return nil
 }
 
 func (g *GlobalAggregationController) Reconcile(ctx context.Context, request controllerruntime.Request) (controllerruntime.Result, error) {
@@ -158,13 +164,14 @@ func (g *GlobalAggregationController) Reconcile(ctx context.Context, request con
 			return controllerruntime.Result{}, nil
 		}
 		log.Error(err, "Failed to get the cluster", "cluster", request.Name)
-		return controllerruntime.Result{RequeueAfter: g.ClusterStatusUpdateFrequency.Duration}, err
+		return controllerruntime.Result{}, err
 	}
 	err := g.syncClusterInformer(ctx, cluster)
 	if err != nil {
 		log.Error(err, "Failed to sync the cluster informer status", "cluster", request.Name)
+		return controllerruntime.Result{}, err
 	}
-	return controllerruntime.Result{RequeueAfter: g.ClusterStatusUpdateFrequency.Duration}, err
+	return controllerruntime.Result{RequeueAfter: g.ClusterStatusUpdateFrequency.Duration}, nil
 }
 
 func (g *GlobalAggregationController) syncClusterInformer(ctx context.Context, cluster *clusterv1alpha1.Cluster) error {
@@ -216,7 +223,7 @@ func (g *GlobalAggregationController) syncClusterInformer(ctx context.Context, c
 	return nil
 }
 
-func (g *GlobalAggregationController) RunWorker() {
+func (g *GlobalAggregationController) RunProcessor() {
 	for g.processNextItem() {
 	}
 }
@@ -274,6 +281,8 @@ func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
 	configMap := currentConfigMap.DeepCopy()
 	currentGlobalRanktable, err := getGlobalRanktableFromConfigMap(currentConfigMap)
 	if err != nil {
+		// in this case, the configMap's current version has no ranktable, or its ranktable is invalid, and we set the DataVersion of the new global ranktable to 1
+		klog.V(4).Infof("The current version of configMap %s has no valid ranktable, and we set the DataVersion of the new global ranktable to 1", configMapName)
 		globalRanktable.DataVersion = 1
 	} else {
 		globalRanktable.DataVersion = currentGlobalRanktable.DataVersion + 1
@@ -288,7 +297,7 @@ func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
 	configMap.Data[MountJobStartHcclName] = string(globalRanktableBytes)
 	_, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Update(ctx, configMap, metav1.UpdateOptions{})
 	if err != nil {
-		klog.V(4).Infof("Failed to update configMap %s, err: %v", configMapName, err)
+		klog.Errorf("Failed to update configMap %s", configMapName)
 		return err
 	} else {
 		klog.V(4).Infof("Successful to update configMap %s", configMapName)
@@ -304,6 +313,8 @@ func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
 	globalNetworkLinks := g.generateHyperJobGlobalNetworkLinks(ctx, hyperJob)
 	currentGlobalNetworkLinks, err := getGlobalNetworkLinksFromConfigMap(currentConfigMap)
 	if err != nil {
+		// in this case, the configMap's current version has no network links, or its network links are invalid, and we set the DataVersion of the new global network links to 1
+		klog.V(4).Infof("The current version of configMap %s has no valid network links, and we set the DataVersion of the new global network links to 1", configMapName)
 		globalNetworkLinks.DataVersion = 1
 	} else {
 		globalNetworkLinks.DataVersion = currentGlobalNetworkLinks.DataVersion + 1
@@ -319,7 +330,7 @@ func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
 
 	_, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Update(ctx, configMap, metav1.UpdateOptions{})
 	if err != nil {
-		klog.V(4).Infof("Failed to update configMap %s, err: %v", configMapName, err)
+		klog.Errorf("Failed to update configMap %s", configMapName)
 		return err
 	} else {
 		klog.V(4).Infof("Successful to update configMap %s", configMapName)
@@ -422,7 +433,8 @@ func (g *GlobalAggregationController) getJobNetworkLinksInfo(ctx context.Context
 	if len(clusterNames) == 0 {
 		clusterNames = g.ClusterEventHandlerStore.ListKeys()
 	}
-	selector := fmt.Sprintf("%s=%s, %s=%s", JobNamespaceLableKey, namespace, JobNameLabelKey, name)
+	labelMap := map[string]string{JobNamespaceLabelKey: namespace, JobNameLabelKey: name}
+	labelSelector := labels.SelectorFromSet(labelMap)
 	for _, clusterName := range clusterNames {
 		if clusterEventHandlerObj, exists := g.ClusterEventHandlerStore.Get(clusterName); exists {
 			clusterEventHandler, ok := clusterEventHandlerObj.(*ClusterEventHandler)
@@ -435,7 +447,7 @@ func (g *GlobalAggregationController) getJobNetworkLinksInfo(ctx context.Context
 					klog.V(4).Infof("Failed to get the dynamic client of cluster %s for job %s, err: %v", clusterName, name, err)
 					continue
 				}
-				unstructuredList, err := dynamicClient.DynamicClientSet.Resource(PodGroupVersionResource).List(ctx, metav1.ListOptions{LabelSelector: selector})
+				unstructuredList, err := dynamicClient.DynamicClientSet.Resource(PodGroupVersionResource).List(ctx, metav1.ListOptions{LabelSelector: labelSelector.String()})
 				if err != nil {
 					klog.V(4).Infof("Failed to get the selected pod list of cluster %s for job %s, err: %v", clusterName, name, err)
 					continue

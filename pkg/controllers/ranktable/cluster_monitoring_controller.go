@@ -64,7 +64,7 @@ func (c *ClusterEventHandler) OnAdd(obj interface{}) {
 		c.ranktableStore.Add(ranktableKey, ranktable)
 		klog.V(4).Infof("The ranktable of configMap %s has been successfully added", configMap.Name)
 	}
-	c.globalController.Queue.AddAfter(SyncEvent{Namespace: configMap.Namespace, Name: owner.Name}, workQueueAddDelay)
+	c.globalController.Queue.Add(SyncEvent{Namespace: configMap.Namespace, Name: owner.Name})
 }
 
 func (c *ClusterEventHandler) OnUpdate(_, newObj interface{}) {

@@ -17,118 +17,17 @@ limitations under the License.
 package ranktable
 
 import (
-	"encoding/json"
 	"fmt"
-	"k8s.io/klog/v2"
 
+	"encoding/json"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/klog/v2"
 
 	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 )
-
-// SingleRanktable stores a specific ranktable for one vcjob in one cluster
-type SingleRanktable struct {
-	Status       string         `json:"status"`
-	Version      string         `json:"version"`
-	DataVersion  int            `json:"data_version,omitempty"`
-	ServerCount  string         `json:"server_count"`
-	ServerList   []ServerBase   `json:"server_list"`
-	SuperPodList []SuperPodBase `json:"super_pod_list,omitempty"`
-	ClusterList  []ClusterBase  `json:"cluster_list,omitempty"`
-}
-
-type ClusterBase struct {
-	ClusterId    string         `json:"cluster_id"`
-	AZId         string         `json:"az_id"`
-	RegionId     string         `json:"region_id"`
-	SuperPodList []SuperPodBase `json:"super_pod_list"`
-}
-
-type ServerBase struct {
-	ServerId string       `json:"server_id"`
-	Device   []DeviceBase `json:"device"`
-}
-
-type DeviceBase struct {
-	DeviceId      string `json:"device_id"`
-	SuperDeviceId string `json:"super_device_id,omitempty"`
-	DeviceIp      string `json:"device_ip"`
-	RankId        string `json:"rank_id"`
-	TorIp         string `json:"tor_ip,omitempty"`
-	TorPort       string `json:"tor_port,omitempty"`
-	DpuIp         string `json:"dpu_ip,omitempty"`
-	NumaId        string `json:"numa_id,omitempty"`
-}
-
-type SuperPodBase struct {
-	SuperPodId string           `json:"super_pod_id"`
-	ServerList []SuperPodServer `json:"server_list,omitempty"`
-}
-
-type SuperPodServer struct {
-	ServerId string `json:"server_id"`
-}
-
-// TorList stores a specific tor list for one vc job in one cluster
-type TorList struct {
-	Status      string      `json:"status"`
-	Version     string      `json:"version"`
-	DataVersion int         `json:"data_version,omitempty"`
-	ServerCount string      `json:"server_count"`
-	ServerList  []TorServer `json:"server_list"`
-}
-
-type TorServer struct {
-	PodName  string      `json:"pod_name"`
-	ServerId string      `json:"server_id"`
-	Device   []TorDevice `json:"device"`
-}
-
-type TorDevice struct {
-	DeviceId string `json:"device_id"`
-	DeviceIp string `json:"device_ip"`
-	TorIp    string `json:"tor_ip"`
-	TorPort  string `json:"tor_port"`
-}
-
-type SingleRanktableInfo struct {
-	clusterId string
-	jobName   string
-	ranktable *SingleRanktable
-}
-
-type GlobalRanktable = SingleRanktable
-
-func NewGlobalRanktable() *GlobalRanktable {
-	return &GlobalRanktable{
-		Status:       "",
-		Version:      RanktableVersion,
-		DataVersion:  0,
-		ServerCount:  "",
-		ServerList:   []ServerBase{},
-		SuperPodList: []SuperPodBase{},
-		ClusterList:  []ClusterBase{},
-	}
-}
-
-type GlobalNetworkLinks struct {
-	Status       string            `json:"status"`
-	DataVersion  int               `json:"data_version"`
-	PodCount     string            `json:"pod_count"`
-	NetworkLinks map[string]string `json:"ips,omitempty"`
-}
-
-func NewGlobalNetworkLinks() *GlobalNetworkLinks {
-	return &GlobalNetworkLinks{
-		Status:       "",
-		DataVersion:  0,
-		PodCount:     "0",
-		NetworkLinks: make(map[string]string),
-	}
-}
 
 var (
 	JobGroupVersionKind = schema.GroupVersionKind{
@@ -144,6 +43,27 @@ var (
 	ConfigMapGroupVersionResource = corev1.SchemeGroupVersion.WithResource("configmaps")
 	PodGroupVersionResource       = corev1.SchemeGroupVersion.WithResource("pods")
 )
+
+func NewGlobalRanktable() *GlobalRanktable {
+	return &GlobalRanktable{
+		Status:       "",
+		Version:      RanktableVersion,
+		DataVersion:  0,
+		ServerCount:  "",
+		ServerList:   []ServerBase{},
+		SuperPodList: []SuperPodBase{},
+		ClusterList:  []ClusterBase{},
+	}
+}
+
+func NewGlobalNetworkLinks() *GlobalNetworkLinks {
+	return &GlobalNetworkLinks{
+		Status:       "",
+		DataVersion:  0,
+		PodCount:     "0",
+		NetworkLinks: make(map[string]string),
+	}
+}
 
 type SyncEvent struct {
 	Namespace string
