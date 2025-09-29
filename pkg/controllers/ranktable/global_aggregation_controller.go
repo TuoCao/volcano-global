@@ -267,22 +267,22 @@ func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
 		return nil
 	}
 
-	// update the global ranktable for the hyperJob
+	// generate the new global ranktable for the hyperJob
 	globalRanktable := g.generateHyperJobGlobalRanktable(hyperJob)
 	if globalRanktable.Status != RanktableStatusCompleted {
 		klog.V(4).Infof("The global ranktable of hyperJob %s is not completed, no need to update its configMap", hyperJob.Name)
 		return nil
 	}
-	configMapName := fmt.Sprintf("%s-%s", hyperJob.Name, GlobalRanktableSuffix)
-	currentConfigMap, err := g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Get(ctx, configMapName, metav1.GetOptions{})
+	ranktableConfigMapName := fmt.Sprintf("%s-%s", hyperJob.Name, GlobalRanktableSuffix)
+	currentRanktableConfigMap, err := g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Get(ctx, ranktableConfigMapName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
-	configMap := currentConfigMap.DeepCopy()
-	currentGlobalRanktable, err := getGlobalRanktableFromConfigMap(currentConfigMap)
+	ranktableConfigMap := currentRanktableConfigMap.DeepCopy()
+	currentGlobalRanktable, err := getGlobalRanktableFromConfigMap(currentRanktableConfigMap)
 	if err != nil {
 		// in this case, the configMap's current version has no ranktable, or its ranktable is invalid, and we set the DataVersion of the new global ranktable to 1
-		klog.V(4).Infof("The current version of configMap %s has no valid ranktable, and we set the DataVersion of the new global ranktable to 1", configMapName)
+		klog.V(4).Infof("The current version of configMap %s has no valid ranktable, and we set the DataVersion of the new global ranktable to 1", ranktableConfigMapName)
 		globalRanktable.DataVersion = 1
 	} else {
 		globalRanktable.DataVersion = currentGlobalRanktable.DataVersion + 1
@@ -291,33 +291,26 @@ func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
 	if err != nil {
 		return err
 	}
-	if len(configMap.Data) == 0 {
-		configMap.Data = make(map[string]string)
+	if len(ranktableConfigMap.Data) == 0 {
+		ranktableConfigMap.Data = make(map[string]string)
 	}
-	configMap.Data[MountJobStartHcclName] = string(globalRanktableBytes)
-	_, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Update(ctx, configMap, metav1.UpdateOptions{})
-	if err != nil {
-		klog.Errorf("Failed to update configMap %s", configMapName)
-		return err
-	} else {
-		klog.V(4).Infof("Successful to update configMap %s", configMapName)
-	}
+	ranktableConfigMap.Data[MountJobStartHcclName] = string(globalRanktableBytes)
 
-	// update the global network links for the hyperJob
-	configMapName = fmt.Sprintf("%s-%s", hyperJob.Name, GlobalNetworkLinksSuffix)
-	currentConfigMap, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Get(ctx, configMapName, metav1.GetOptions{})
+	// generate the new global network links for the hyperJob
+	networkLinksConfigMapName := fmt.Sprintf("%s-%s", hyperJob.Name, GlobalNetworkLinksSuffix)
+	currentNetworkLinksConfigMap, err := g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Get(ctx, networkLinksConfigMapName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
-	configMap = currentConfigMap.DeepCopy()
+	networkLinksConfigMap := currentNetworkLinksConfigMap.DeepCopy()
 	globalNetworkLinks, err := g.generateHyperJobGlobalNetworkLinks(ctx, hyperJob)
 	if err != nil {
 		return err
 	}
-	currentGlobalNetworkLinks, err := getGlobalNetworkLinksFromConfigMap(currentConfigMap)
+	currentGlobalNetworkLinks, err := getGlobalNetworkLinksFromConfigMap(currentNetworkLinksConfigMap)
 	if err != nil {
 		// in this case, the configMap's current version has no network links, or its network links are invalid, and we set the DataVersion of the new global network links to 1
-		klog.V(4).Infof("The current version of configMap %s has no valid network links, and we set the DataVersion of the new global network links to 1", configMapName)
+		klog.V(4).Infof("The current version of configMap %s has no valid network links, and we set the DataVersion of the new global network links to 1", networkLinksConfigMapName)
 		globalNetworkLinks.DataVersion = 1
 	} else {
 		globalNetworkLinks.DataVersion = currentGlobalNetworkLinks.DataVersion + 1
@@ -326,17 +319,25 @@ func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
 	if err != nil {
 		return err
 	}
-	if len(configMap.Data) == 0 {
-		configMap.Data = make(map[string]string)
+	if len(networkLinksConfigMap.Data) == 0 {
+		networkLinksConfigMap.Data = make(map[string]string)
 	}
-	configMap.Data[MountNetworkLinksName] = string(globalNetworkLinksBytes)
+	networkLinksConfigMap.Data[MountNetworkLinksName] = string(globalNetworkLinksBytes)
 
-	_, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Update(ctx, configMap, metav1.UpdateOptions{})
+	// update the two configMaps
+	_, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Update(ctx, ranktableConfigMap, metav1.UpdateOptions{})
 	if err != nil {
-		klog.Errorf("Failed to update configMap %s", configMapName)
+		klog.Errorf("Failed to update configMap %s", ranktableConfigMapName)
 		return err
 	} else {
-		klog.V(4).Infof("Successful to update configMap %s", configMapName)
+		klog.V(4).Infof("Successful to update configMap %s", ranktableConfigMapName)
+	}
+	_, err = g.KubeClient.CoreV1().ConfigMaps(hyperJob.Namespace).Update(ctx, networkLinksConfigMap, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Errorf("Failed to update configMap %s", networkLinksConfigMapName)
+		return err
+	} else {
+		klog.V(4).Infof("Successful to update configMap %s", networkLinksConfigMapName)
 	}
 	return nil
 }
@@ -461,6 +462,8 @@ func (g *GlobalAggregationController) getJobNetworkLinksInfo(ctx context.Context
 					if err = runtime.DefaultUnstructuredConverter.FromUnstructured(item.Object, pod); err != nil {
 						klog.V(4).Infof("Failed to convert the unstructured item of cluster %s for job %s to a pod, err: %v", clusterName, name, err)
 						return nil, err
+					} else if pod.Status.PodIP == "" {
+						return nil, fmt.Errorf("the IP of pod %s on cluster %s is empty", pod.Name, clusterName)
 					} else {
 						networkLinkMap[fmt.Sprintf("%s.%s", pod.Name, clusterName)] = pod.Status.PodIP
 					}
