@@ -19,6 +19,7 @@ package ranktable
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,6 +65,64 @@ func NewGlobalNetworkLinks() *GlobalNetworkLinks {
 		PodCount:     "0",
 		NetworkLinks: make(map[string]string),
 	}
+}
+
+func (g *GlobalNetworkLinks) marshalJson() ([]byte, error) {
+	if len(g.NetworkLinks) == 0 {
+		return json.Marshal(g)
+	}
+
+	buffer := make([]byte, 0)
+	buffer = append(buffer, '{')
+
+	statusJson, err := json.Marshal(g.Status)
+	if err != nil {
+		return nil, err
+	}
+	buffer = append(buffer, `"status":`...)
+	buffer = append(buffer, statusJson...)
+	buffer = append(buffer, ',')
+
+	dataVersionJson, err := json.Marshal(g.DataVersion)
+	if err != nil {
+		return nil, err
+	}
+	buffer = append(buffer, `"data_version":`...)
+	buffer = append(buffer, dataVersionJson...)
+	buffer = append(buffer, ',')
+
+	podCountJson, err := json.Marshal(g.PodCount)
+	if err != nil {
+		return nil, err
+	}
+	buffer = append(buffer, `"pod_count":`...)
+	buffer = append(buffer, podCountJson...)
+	buffer = append(buffer, ',')
+
+	buffer = append(buffer, `"ips":{`...)
+	podNames := make([]string, 0, len(g.NetworkLinks))
+	for name := range g.NetworkLinks {
+		podNames = append(podNames, name)
+	}
+	sort.Strings(podNames)
+	for index, podName := range podNames {
+		if index > 0 {
+			buffer = append(buffer, ',')
+		}
+		podNameJson, err := json.Marshal(podName)
+		if err != nil {
+			return nil, err
+		}
+		buffer = append(buffer, podNameJson...)
+		buffer = append(buffer, ':')
+		podIPJson, err := json.Marshal(g.NetworkLinks[podName])
+		if err != nil {
+			return nil, err
+		}
+		buffer = append(buffer, podIPJson...)
+	}
+	buffer = append(buffer, '}', '}')
+	return buffer, nil
 }
 
 type SyncEvent struct {

@@ -322,7 +322,7 @@ func (g *GlobalAggregationController) handleEvent(syncEvent SyncEvent) error {
 	} else {
 		globalNetworkLinks.DataVersion = currentGlobalNetworkLinks.DataVersion + 1
 	}
-	globalNetworkLinksBytes, err := json.Marshal(globalNetworkLinks)
+	globalNetworkLinksBytes, err := globalNetworkLinks.marshalJson()
 	if err != nil {
 		return err
 	}
